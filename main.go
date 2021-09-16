@@ -8,25 +8,17 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
 	"regexp"
 	"strings"
 	"time"
-	"unicode"
 
+	"github.com/bep/npmgoproxy/npmgop"
 	"golang.org/x/mod/module"
-
-	"golang.org/x/mod/zip"
 )
-
-// TODO1
-//  npm pack --dry-run simple-icons
 
 func main() {
 
-	if false {
-		createZip()
-		return
-	}
 	handler := &gomodproxy{}
 
 	server := &http.Server{Addr: ":8072", Handler: handler}
@@ -40,6 +32,8 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt)
 
+	fmt.Println("gomodproxy running ...")
+
 	<-stop
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -52,7 +46,7 @@ func main() {
 type gomodproxy struct {
 }
 
-const npmjsPrefix = "/gohugo.io"
+const npmjsPrefix = npmgop.ModPathBase + "/"
 
 var (
 	apiList = regexp.MustCompile(`^/(?P<module>.*)/@v/list$`)
@@ -61,11 +55,15 @@ var (
 	apiZip  = regexp.MustCompile(`^/(?P<module>.*)/@v/(?P<version>.*).zip$`)
 )
 
-var (
-	testMod         = "npmjs"
-	testModVersion  = "v1.13.0"
-	testModVersions = []string{testModVersion}
-)
+type moduleContext struct {
+	NpmPackage       string
+	Version          string
+	PathMajorVersion string
+}
+
+func (ctx moduleContext) String() string {
+	return fmt.Sprintf("%s|%s|%s", ctx.NpmPackage, ctx.Version, ctx.PathMajorVersion)
+}
 
 func (g *gomodproxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -74,34 +72,53 @@ func (g *gomodproxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !strings.HasPrefix(r.URL.Path, npmjsPrefix) {
+	if !strings.HasPrefix(r.URL.Path, "/"+npmjsPrefix) {
+		http.NotFound(w, r)
 		return
 	}
-
-	urlPath := strings.TrimPrefix(r.URL.Path, npmjsPrefix)
 
 	for _, route := range []struct {
 		id      string
 		regexp  *regexp.Regexp
-		handler func(w http.ResponseWriter, r *http.Request, module, version string)
+		handler func(w http.ResponseWriter, r *http.Request, mctx moduleContext)
 	}{
 		{"list", apiList, g.list},
 		{"info", apiInfo, g.info},
 		{"gomodproxy", apiMod, g.mod},
 		{"zip", apiZip, g.zip},
 	} {
-		if m := route.regexp.FindStringSubmatch(urlPath); m != nil {
-			module, version := m[1], ""
+		if m := route.regexp.FindStringSubmatch(r.URL.Path); m != nil {
+			pathVersion, version := m[1], ""
 			if len(m) > 2 {
 				version = m[2]
 			}
-			module = decodeBangs(module)
-			if r.Method == http.MethodDelete && version != "" {
-				g.delete(w, r, module, version)
+
+			pathVersion, err := module.EscapePath(pathVersion)
+			if err != nil {
+				g.fail(w, "failed to escape path", err)
 				return
 			}
 
-			route.handler(w, r, module, version)
+			if pathVersion == npmgop.ModPathBase {
+				http.NotFound(w, r)
+				return
+			}
+
+			npmPackage, major, _ := module.SplitPathVersion(pathVersion)
+			npmPackage = strings.TrimPrefix(npmPackage, npmjsPrefix)
+
+			mctx := moduleContext{
+				NpmPackage:       npmPackage,
+				PathMajorVersion: major,
+				Version:          version,
+			}
+
+			if r.Method == http.MethodDelete && version != "" {
+				g.delete(w, r, mctx)
+				return
+			}
+
+			route.handler(w, r, mctx)
 			return
 		}
 	}
@@ -113,106 +130,94 @@ func (g *gomodproxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	return []byte("TODO(module)"), time.Now(), nil
 }*/
 
-func (g *gomodproxy) list(w http.ResponseWriter, r *http.Request, module, version string) {
-	fmt.Println("gomodproxy.list", "module", module, "version", version)
-	versions := strings.Join(testModVersions, "\n")
-	fmt.Fprint(w, versions)
+// $base/$module/@v/list
+// Returns a list of known versions of the given module in plain text, one per line.
+// This list should not include pseudo-versions.
+func (g *gomodproxy) list(w http.ResponseWriter, r *http.Request, mctx moduleContext) {
+	fmt.Println("gomodproxy.list", mctx)
+
+	npmpkg, err := npmgop.FetchPackage(mctx.NpmPackage)
+	if err != nil {
+		g.fail(w, "failed to fetch package", err)
+		return
+	}
+
+	var versions []string
+	for _, v := range npmpkg.Versions {
+		versions = append(versions, v.Version)
+	}
+	fmt.Fprint(w, strings.Join(versions, "\n"))
 
 }
 
-func (g *gomodproxy) info(w http.ResponseWriter, r *http.Request, module, version string) {
-	fmt.Println("gomodproxy.info", "module", module, "version", version)
+func (g *gomodproxy) info(w http.ResponseWriter, r *http.Request, mctx moduleContext) {
+	fmt.Println("gomodproxy.info", mctx)
+
+	npmv, err := npmgop.FetchPackageVersion(mctx.NpmPackage, mctx.Version)
+	if err != nil {
+		g.fail(w, "failed to fetch package version", err)
+		return
+	}
 
 	info := versionInfo{
-		Version: testModVersion,
+		Version: npmv.Version,
+		// TODO1 time
 	}
 	jsonEnc := json.NewEncoder(w)
 	jsonEnc.Encode(info)
 
 }
 
-func (g *gomodproxy) mod(w http.ResponseWriter, r *http.Request, module, version string) {
-	fmt.Println("gomodproxy.mod", "module", module, "version", version)
+func (g *gomodproxy) mod(w http.ResponseWriter, r *http.Request, mctx moduleContext) {
+	fmt.Println("gomodproxy.mod", mctx)
 
+	// TODO1 deps
 	gomod := `
 
-module gohugo.io/npmjs/simple-icons
+module gohugo.io/npmjs/%s
 
 go 1.17
 	
 	
 `
-	fmt.Fprint(gomod)
+	fmt.Fprint(w, fmt.Sprintf(gomod, path.Join(mctx.NpmPackage, mctx.PathMajorVersion)))
 
 }
 
-func (g *gomodproxy) zip(w http.ResponseWriter, r *http.Request, module, version string) {
-	fmt.Println("gomodproxy.zip", "module", module, "version", version)
-	zipFilename := "simple-icons-5.13.0.zip"
-	f, err := os.Open(zipFilename)
+func (g *gomodproxy) zip(w http.ResponseWriter, r *http.Request, mctx moduleContext) {
+	fmt.Println("gomodproxy.zip", mctx)
+
+	npmv, err := npmgop.FetchPackageVersion(mctx.NpmPackage, mctx.Version)
 	if err != nil {
-		g.fail(w, err)
+		g.fail(w, "failed to fetch package version", err)
+		return
+	}
+
+	f, err := npmgop.CreateZipFromVersion(npmv)
+	if err != nil {
+		g.fail(w, "failed to create module zip", err)
 		return
 	}
 	defer f.Close()
-	http.ServeContent(w, r, zipFilename, time.Now(), f)
+
+	// TODO1 cache + cache headers
+	http.ServeContent(w, r, f.Name(), time.Now(), f)
 
 }
 
-func (g *gomodproxy) delete(w http.ResponseWriter, r *http.Request, module, version string) {
-	fmt.Println("gomodproxy.delete", "module", module, "version", version)
+func (g *gomodproxy) delete(w http.ResponseWriter, r *http.Request, mctx moduleContext) {
+	fmt.Println("gomodproxy.delete")
 
 }
 
-func (g *gomodproxy) fail(w http.ResponseWriter, err error) {
+func (g *gomodproxy) fail(w http.ResponseWriter, what string, err error) {
+	err = fmt.Errorf("%s: %s", what, err)
 	fmt.Println("error:", err)
 	w.WriteHeader(http.StatusInternalServerError)
 	fmt.Fprint(w, err.Error())
 }
 
-func checkZipFile(name, modulePath, moduleVersion string) error {
-	_, err := zip.CheckZip(
-		module.Version{
-			Path:    modulePath,
-			Version: moduleVersion,
-		},
-		name,
-	)
-
-	return err
-}
-
-func decodeBangs(s string) string {
-	buf := []rune{}
-	bang := false
-	for _, r := range []rune(s) {
-		if bang {
-			bang = false
-			buf = append(buf, unicode.ToUpper(r))
-			continue
-		}
-		if r == '!' {
-			bang = true
-			continue
-		}
-		buf = append(buf, r)
-	}
-	return string(buf)
-}
-
 type versionInfo struct {
 	Version string    // version string
 	Time    time.Time // commit time
-}
-
-func createZip() {
-	f, err := os.Create("simple-icons-5.13.0.zip")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer f.Close()
-	err = zip.CreateFromDir(f, module.Version{Path: "gohugo.io/npmjs/simple-icons", Version: testModVersion}, "package")
-	if err != nil {
-		log.Fatal(err)
-	}
 }
