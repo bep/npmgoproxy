@@ -1,4 +1,4 @@
-package npmgop
+package internal
 
 import (
 	"archive/tar"
@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"path"
@@ -22,38 +23,60 @@ import (
 	"golang.org/x/mod/zip"
 )
 
-type NameReadSeekCloser interface {
-	Name() string
-	io.ReadSeekCloser
-}
-
 const (
 	ModPathBase = "gohugo.io/npmjs"
 )
 
-var tempDir = "/Users/bep/dump/npmtemp"
+func FetchPackage(s string) (NpmPackage, error) {
+	var npmp NpmPackage
+	client := &http.Client{
+		Timeout: time.Second * 10,
+	}
 
-type NpmPackage struct {
-	Name     string   `json:"name"`
-	DistTags DistTags `json:"dist-tags"`
-	Versions Versions `json:"versions"`
+	req, err := http.NewRequest("GET", fmt.Sprintf("https://registry.npmjs.org/%s", s), nil)
+	if err != nil {
+		return npmp, err
+	}
+	req.Header.Set("Accept", "application/vnd.npm.install-v1+json")
+
+	r, err := client.Do(req)
+	if err != nil {
+		return npmp, err
+	}
+
+	defer r.Body.Close()
+
+	err = json.NewDecoder(r.Body).Decode(&npmp)
+	if err == io.EOF {
+		err = nil
+	}
+
+	return npmp, err
 }
 
-type Version struct {
-	Name         string       `json:"name"`
-	Version      string       `json:"version"`
-	Dependencies Dependencies `json:"dependencies"`
-	Dist         Dist         `json:"dist"`
+func FetchPackageVersion(pack, version string) (Version, error) {
+	npmpkg, err := FetchPackage(pack)
+	if err != nil {
+		return Version{}, err
+	}
+
+	npmv, found := npmpkg.Versions.ByVersion(version)
+	if !found {
+		return npmv, fmt.Errorf("version %q not found for package %q", version, pack)
+	}
+	return npmv, nil
 }
 
-type Dist struct {
-	ShaSum  string `json:"shasum"`
-	Tarball string `json:"tarball"`
-}
-
-type Dependency struct {
-	Name         string
-	VersionRange string
+func CreateZipFromVersion(last Version) (nameReadSeekCloser, error) {
+	tempDir, err := ioutil.TempDir("", "npmgop")
+	if err != nil {
+		return nil, err
+	}
+	tarFilename := filepath.Join(tempDir, EscapePackage(last.Name))
+	if err := downloadTarball(last.Dist, tarFilename); err != nil {
+		return nil, err
+	}
+	return repackTarballAsZip(tarFilename, last)
 }
 
 type Dependencies []Dependency
@@ -81,6 +104,43 @@ func (vs *Dependencies) UnmarshalJSON(b []byte) error {
 	})
 
 	return nil
+}
+
+type Dependency struct {
+	Name         string
+	VersionRange string
+}
+
+type Dist struct {
+	ShaSum  string `json:"shasum"`
+	Tarball string `json:"tarball"`
+}
+
+type DistTags struct {
+	Latest string
+}
+
+func (tags *DistTags) UnmarshalJSON(b []byte) error {
+	var m map[string]string
+	err := json.Unmarshal(b, &m)
+	if err != nil {
+		return err
+	}
+	tags.Latest = normalizeSemver(m["latest"])
+	return nil
+}
+
+type NpmPackage struct {
+	Name     string   `json:"name"`
+	DistTags DistTags `json:"dist-tags"`
+	Versions Versions `json:"versions"`
+}
+
+type Version struct {
+	Name         string       `json:"name"`
+	Version      string       `json:"version"`
+	Dependencies Dependencies `json:"dependencies"`
+	Dist         Dist         `json:"dist"`
 }
 
 type Versions []Version
@@ -117,75 +177,9 @@ func (vs *Versions) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-type DistTags struct {
-	Latest string
-}
-
-func (tags *DistTags) UnmarshalJSON(b []byte) error {
-	var m map[string]string
-	err := json.Unmarshal(b, &m)
-	if err != nil {
-		return err
-	}
-	tags.Latest = normalizeSemver(m["latest"])
-	return nil
-}
-
-func FetchPackage(s string) (NpmPackage, error) {
-	var npmp NpmPackage
-	var client = &http.Client{
-		Timeout: time.Second * 10,
-	}
-
-	req, err := http.NewRequest("GET", fmt.Sprintf("https://registry.npmjs.org/%s", s), nil)
-	if err != nil {
-		return npmp, err
-	}
-	req.Header.Set("Accept", "application/vnd.npm.install-v1+json")
-
-	r, err := client.Do(req)
-	if err != nil {
-		return npmp, err
-	}
-
-	defer r.Body.Close()
-
-	err = json.NewDecoder(r.Body).Decode(&npmp)
-	if err == io.EOF {
-		err = nil
-	}
-
-	return npmp, err
-
-}
-
-func FetchPackageVersion(pack, version string) (Version, error) {
-	npmpkg, err := FetchPackage(pack)
-	if err != nil {
-		return Version{}, err
-	}
-
-	npmv, found := npmpkg.Versions.ByVersion(version)
-	if !found {
-		return npmv, fmt.Errorf("version %q not found for package %q", version, pack)
-	}
-	return npmv, nil
-}
-
-func CreateZipFromVersion(last Version) (NameReadSeekCloser, error) {
-	tarFilename := filepath.Join(tempDir, last.Name)
-	if err := downloadTarball(last.Dist, tarFilename); err != nil {
-		return nil, err
-	}
-	return repackTarballAsZip(tarFilename, last)
-}
-
-func normalizeSemver(s string) string {
-	// Make the version Go semver compatible.
-	if !strings.HasPrefix(s, "v") {
-		s = "v" + s
-	}
-	return s
+type nameReadSeekCloser interface {
+	io.ReadSeekCloser
+	Name() string
 }
 
 func downloadTarball(dist Dist, target string) (err error) {
@@ -221,9 +215,17 @@ func downloadTarball(dist Dist, target string) (err error) {
 	return nil
 }
 
-func repackTarballAsZip(tarFilename string, version Version) (NameReadSeekCloser, error) {
+func normalizeSemver(s string) string {
+	// Make the version Go semver compatible.
+	if !strings.HasPrefix(s, "v") {
+		s = "v" + s
+	}
+	return s
+}
+
+func repackTarballAsZip(tarFilename string, version Version) (nameReadSeekCloser, error) {
 	tarDir := filepath.Join(filepath.Dir(tarFilename), fmt.Sprintf("%s-%s-%s", version.Name, version.Version, version.Dist.ShaSum))
-	if err := os.MkdirAll(tarDir, 0755); err != nil {
+	if err := os.MkdirAll(tarDir, 0o755); err != nil {
 		return nil, err
 	}
 	tf, err := os.Open(tarFilename)
@@ -247,7 +249,6 @@ func repackTarballAsZip(tarFilename string, version Version) (NameReadSeekCloser
 	}
 
 	return f, zip.CreateFromDir(f, module.Version{Path: path.Join(ModPathBase, version.Name, major), Version: version.Version}, tarDir)
-
 }
 
 func untar(dst string, r io.Reader) error {
@@ -275,12 +276,12 @@ func untar(dst string, r io.Reader) error {
 		switch header.Typeflag {
 		case tar.TypeDir:
 			if _, err := os.Stat(target); err != nil {
-				if err := os.MkdirAll(target, 0755); err != nil {
+				if err := os.MkdirAll(target, 0o755); err != nil {
 					return err
 				}
 			}
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
 
@@ -295,4 +296,12 @@ func untar(dst string, r io.Reader) error {
 			f.Close()
 		}
 	}
+}
+
+func EscapePackage(p string) string {
+	return strings.ReplaceAll(p, "@", "___")
+}
+
+func UnEscapePackage(p string) string {
+	return strings.ReplaceAll(p, "___", "@")
 }
