@@ -72,9 +72,9 @@ func CreateZipFromVersion(last Version) (nameReadSeekCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	tarFilename := filepath.Join(tempDir, EscapePackage(last.Name))
+	tarFilename := filepath.Join(tempDir, strings.ReplaceAll(last.Name, "/", "_"))
 	if err := downloadTarball(last.Dist, tarFilename); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to download tarball: %s", err)
 	}
 	return repackTarballAsZip(tarFilename, last)
 }
@@ -248,7 +248,7 @@ func repackTarballAsZip(tarFilename string, version Version) (nameReadSeekCloser
 		major = ""
 	}
 
-	return f, zip.CreateFromDir(f, module.Version{Path: path.Join(ModPathBase, version.Name, major), Version: version.Version}, tarDir)
+	return f, zip.CreateFromDir(f, module.Version{Path: path.Join(ModPathBase, EscapePackage(version.Name), major), Version: version.Version}, tarDir)
 }
 
 func untar(dst string, r io.Reader) error {

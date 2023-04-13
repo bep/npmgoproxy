@@ -146,7 +146,7 @@ go 1.17
 	
 `
 
-	fmt.Fprintf(w, gomod, path.Join(mctx.NpmPackage, mctx.PathMajorVersion), requires)
+	fmt.Fprintf(w, gomod, path.Join(internal.EscapePackage(mctx.NpmPackage), mctx.PathMajorVersion), requires)
 }
 
 func (g *npmGoModProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
