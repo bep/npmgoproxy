@@ -244,7 +244,7 @@ func repackTarballAsZip(tarFilename string, version Version) (nameReadSeekCloser
 	}
 
 	major := semver.Major(version.Version)
-	if major == "v1" {
+	if major == "v1" || major == "v0" {
 		major = ""
 	}
 
